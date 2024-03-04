@@ -7,6 +7,27 @@ fn hang() void {
     }
 }
 
+const TimerCtx = struct {
+    sig: usize,
+    per_timer: uefi.Event,
+};
+
+const EfiEventType = enum(u32) {
+    timer = 0x8000_0000,
+    runtime = 0x4000_0000,
+    notify_wait = 0x0000_0100,
+    notify_signal = 0x0000_0200,
+    exit_boot_services = 0x0000_0201,
+    virtual_address_change = 0x6000_0202,
+};
+
+const EfiTPL = enum(usize) {
+    application = 4,
+    callback = 8,
+    notify = 16,
+    high_level = 31,
+};
+
 const EfiColor = enum(usize) {
     black,
     blue,
@@ -81,14 +102,15 @@ fn print(out: *const uefi.protocol.SimpleTextOutput, buf: []const u8) void {
 
 const EfiInputKey = uefi.protocol.SimpleTextInput.Key;
 
-pub fn timerNotify(event: uefi.Event, data: ?*anyopaque) callconv(.Win64) void {
+pub fn timerNotify(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
     _ = event;
-    if (data) |b| {
-        const console_out: *uefi.protocol.SimpleTextOutput = @ptrCast(@alignCast(b));
-        var buf = std.mem.zeroes([128]u8);
-        const msg = std.fmt.bufPrint(&buf, "{any}\r\n", .{data}) catch "Creating buffer failed!\r\n";
-        print(console_out, msg);
-    }
+    _ = data;
+    // if (data) |b| {
+    //     const console_out = uefi.system_table.con_out.?;
+    //     const timer_ctx: *TimerCtx = @ptrCast(@alignCast(b));
+    //     _ = timer_ctx;
+    //     print(console_out, "Got timer ctx");
+    // }
 }
 
 pub fn main() void {
@@ -102,21 +124,30 @@ pub fn main() void {
     const console_in = uefi.system_table.con_in.?;
     _ = console_in.reset(true);
 
-    status = boot_services.stall(1000000);
-    if (status != uefi.Status.Success) {
-        print(console_out, "Stalling failed!\r\n");
-        hang();
-    }
+    // status = boot_services.stall(1000000);
+    // if (status != uefi.Status.Success) {
+    //     print(console_out, "Stalling failed!\r\n");
+    //     hang();
+    // }
 
-    var event: uefi.Event = undefined;
-    status = boot_services.createEvent(0x80000000, 8, timerNotify, console_out, &event);
+    var timer_ctx = TimerCtx{
+        .sig = 908342234908,
+        .per_timer = std.mem.zeroes(uefi.Event),
+    };
+    status = boot_services.createEvent(
+        @intFromEnum(EfiEventType.timer) | @intFromEnum(EfiEventType.notify_signal),
+        @intFromEnum(EfiTPL.notify),
+        timerNotify,
+        &timer_ctx,
+        &timer_ctx.per_timer,
+    );
     if (status != uefi.Status.Success) {
         print(console_out, "Creating event failed!\r\n");
         hang();
     }
-    defer _ = boot_services.closeEvent(event);
+    defer _ = boot_services.closeEvent(timer_ctx.per_timer);
 
-    status = boot_services.setTimer(event, .TimerPeriodic, 1000);
+    status = boot_services.setTimer(timer_ctx.per_timer, .TimerPeriodic, 1000);
     if (status != uefi.Status.Success) {
         print(console_out, "Couldn't set timer interval!\r\n");
         hang();
