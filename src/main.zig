@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-// const utf16 = std.unicode.utf8ToUtf16LeStringLiteral;
 const uefi = std.os.uefi;
 fn hang() void {
     while (true) {
@@ -82,7 +81,15 @@ fn print(out: *const uefi.protocol.SimpleTextOutput, buf: []const u8) void {
 
 const EfiInputKey = uefi.protocol.SimpleTextInput.Key;
 
-pub fn timerNotify(event: uefi.Event, data: ?*anyopaque) callconv(.cc) void {}
+pub fn timerNotify(event: uefi.Event, data: ?*anyopaque) callconv(.Win64) void {
+    _ = event;
+    if (data) |b| {
+        const console_out: *uefi.protocol.SimpleTextOutput = @ptrCast(@alignCast(b));
+        var buf = std.mem.zeroes([128]u8);
+        const msg = std.fmt.bufPrint(&buf, "{any}\r\n", .{data}) catch "Creating buffer failed!\r\n";
+        print(console_out, msg);
+    }
+}
 
 pub fn main() void {
     const boot_services = uefi.system_table.boot_services.?;
@@ -95,14 +102,25 @@ pub fn main() void {
     const console_in = uefi.system_table.con_in.?;
     _ = console_in.reset(true);
 
+    status = boot_services.stall(1000000);
+    if (status != uefi.Status.Success) {
+        print(console_out, "Stalling failed!\r\n");
+        hang();
+    }
+
     var event: uefi.Event = undefined;
-    status = boot_services.createEvent(0x80000000, 8, null, null, &event);
+    status = boot_services.createEvent(0x80000000, 8, timerNotify, console_out, &event);
     if (status != uefi.Status.Success) {
         print(console_out, "Creating event failed!\r\n");
         hang();
     }
+    defer _ = boot_services.closeEvent(event);
 
-    boot_services.setTimer(event, .TimerPeriodic, 10000000);
+    status = boot_services.setTimer(event, .TimerPeriodic, 1000);
+    if (status != uefi.Status.Success) {
+        print(console_out, "Couldn't set timer interval!\r\n");
+        hang();
+    }
 
     status = console_out.setAttribute(EfiColor.black.bg(EfiColor.light_gray));
     if (status != uefi.Status.Success) {
