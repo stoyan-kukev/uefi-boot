@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
 
     const install_step = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .bin } });
 
-    const run_cmd = b.addSystemCommand(&.{ "qemu-system-x86_64", "-serial", "stdio", "-bios", "OVMF.fd", "-drive", "format=raw,file=fat:rw:zig-out" });
+    const run_cmd = b.addSystemCommand(&.{ "qemu-system-x86_64", "-bios", "OVMF.fd", "-drive", "format=raw,file=fat:rw:zig-out" });
     run_cmd.step.dependOn(&install_step.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);

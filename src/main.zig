@@ -7,11 +7,6 @@ fn hang() void {
     }
 }
 
-const TimerCtx = struct {
-    sig: usize,
-    per_timer: uefi.Event,
-};
-
 const EfiEventType = enum(u32) {
     timer = 0x8000_0000,
     runtime = 0x4000_0000,
@@ -102,15 +97,16 @@ fn print(out: *const uefi.protocol.SimpleTextOutput, buf: []const u8) void {
 
 const EfiInputKey = uefi.protocol.SimpleTextInput.Key;
 
+const TimerCtx = struct {
+    console_out: *uefi.protocol.SimpleTextOutput,
+};
+
 pub fn timerNotify(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
     _ = event;
-    _ = data;
-    // if (data) |b| {
-    //     const console_out = uefi.system_table.con_out.?;
-    //     const timer_ctx: *TimerCtx = @ptrCast(@alignCast(b));
-    //     _ = timer_ctx;
-    //     print(console_out, "Got timer ctx");
-    // }
+    if (data) |timer_ctx| {
+        const timer_data: *TimerCtx = @ptrCast(@alignCast(timer_ctx));
+        print(timer_data.console_out, "test 123");
+    }
 }
 
 pub fn main() void {
@@ -130,30 +126,52 @@ pub fn main() void {
     //     hang();
     // }
 
-    var timer_ctx = TimerCtx{
-        .sig = 908342234908,
-        .per_timer = std.mem.zeroes(uefi.Event),
-    };
+    var timer_ctx = TimerCtx{ .console_out = console_out };
+    var event: uefi.Event = undefined;
+
     status = boot_services.createEvent(
         @intFromEnum(EfiEventType.timer) | @intFromEnum(EfiEventType.notify_signal),
-        @intFromEnum(EfiTPL.notify),
+        @intFromEnum(EfiTPL.callback),
         timerNotify,
         &timer_ctx,
-        &timer_ctx.per_timer,
+        &event,
     );
     if (status != uefi.Status.Success) {
         print(console_out, "Creating event failed!\r\n");
         hang();
     }
-    defer _ = boot_services.closeEvent(timer_ctx.per_timer);
+    defer _ = boot_services.closeEvent(event);
 
-    status = boot_services.setTimer(timer_ctx.per_timer, .TimerPeriodic, 1000);
+    status = boot_services.setTimer(event, .TimerPeriodic, 10000000);
+    if (status != uefi.Status.Success) {
+        print(console_out, "Couldn't set timer interval!\r\n");
+        hang();
+    }
+
+    var timer_ctx2 = TimerCtx{ .console_out = console_out };
+    var event2: uefi.Event = undefined;
+
+    status = boot_services.createEvent(
+        @intFromEnum(EfiEventType.timer) | @intFromEnum(EfiEventType.notify_signal),
+        @intFromEnum(EfiTPL.callback),
+        timerNotify,
+        &timer_ctx2,
+        &event2,
+    );
+    if (status != uefi.Status.Success) {
+        print(console_out, "Creating event failed!\r\n");
+        hang();
+    }
+    defer _ = boot_services.closeEvent(event2);
+
+    status = boot_services.setTimer(event2, .TimerPeriodic, 20000000);
     if (status != uefi.Status.Success) {
         print(console_out, "Couldn't set timer interval!\r\n");
         hang();
     }
 
     status = console_out.setAttribute(EfiColor.black.bg(EfiColor.light_gray));
+    status = console_out.clearScreen();
     if (status != uefi.Status.Success) {
         print(console_out, "Changing print color failed!\r\n");
         hang();
@@ -171,7 +189,7 @@ pub fn main() void {
     var size_of_info = std.mem.zeroes(usize);
     var info = std.mem.zeroes(uefi.protocol.GraphicsOutput.Mode.Info);
     var ptr = &info;
-    status = gop.queryMode(0, &size_of_info, &ptr);
+    status = gop.queryMode(29, &size_of_info, &ptr);
     if (status != uefi.Status.Success) {
         print(console_out, "Quering for mode 0 failed\r\n!");
         hang();
@@ -206,21 +224,23 @@ pub fn main() void {
         print(console_out, msg);
     }
 
-    status = gop.setMode(0);
+    status = gop.setMode(15);
     if (status != uefi.Status.Success) {
         print(console_out, "Set mode 0 failed!\r\n");
         hang();
     }
 
-    print(console_out, "Enter any key: \r\n");
+    while (true) {
+        print(console_out, "Enter any key: \r\n");
 
-    var key: EfiInputKey.Input = undefined;
-    while (console_in.readKeyStroke(&key) == uefi.Status.NotReady) {}
-    print(console_out, "Found key!\r\n");
+        var key: EfiInputKey.Input = undefined;
+        while (console_in.readKeyStroke(&key) == uefi.Status.NotReady) {}
+        print(console_out, "Found key!\r\n");
 
-    var buf = std.mem.zeroes([128]u8);
-    const msg = std.fmt.bufPrint(&buf, "key pressed: {}\r\n", .{key.unicode_char}) catch "Creating buffer failed!\r\n";
-    print(console_out, msg);
+        var buf = std.mem.zeroes([128]u8);
+        const msg = std.fmt.bufPrint(&buf, "key pressed: {}\r\n", .{key.unicode_char}) catch "Creating buffer failed!\r\n";
+        print(console_out, msg);
+    }
 
     hang();
 }
