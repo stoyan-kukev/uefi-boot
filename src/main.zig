@@ -95,6 +95,24 @@ fn print(out: *const uefi.protocol.SimpleTextOutput, buf: []const u8) void {
     }
 }
 
+pub fn checkForError(status: uefi.Status, msg: []const u8) void {
+    const cout = uefi.system_table.con_out.?;
+
+    switch (status) {
+        .Success => {},
+        else => {
+            var buf = std.mem.zeroes([128]u8);
+            const fmt_msg = std.fmt.bufPrint(
+                &buf,
+                "[{}] {s}",
+                .{ status, msg },
+            ) catch "Creating buffer failed\r\n";
+            print(cout, fmt_msg);
+            hang();
+        },
+    }
+}
+
 const EfiInputKey = uefi.protocol.SimpleTextInput.Key;
 
 const TimerCtx = struct {
@@ -102,8 +120,8 @@ const TimerCtx = struct {
 };
 
 const DateCtx = struct {
-    cols: u32,
-    rows: u32,
+    max_cols: u32,
+    max_rows: u32,
     cout: *uefi.protocol.SimpleTextOutput,
     rt_services: *uefi.tables.RuntimeServices,
 };
@@ -122,18 +140,12 @@ pub fn print_date(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
         const ctx: *DateCtx = @ptrCast(@alignCast(date_ctx));
         var time: uefi.Time = undefined;
         var status = ctx.rt_services.getTime(&time, null);
-        if (status != uefi.Status.Success) {
-            print(ctx.cout, "Couldn't get time!\r\n");
-            hang();
-        }
+        checkForError(status, "Couldn't get time!\r\n");
 
-        const save_cols = ctx.cols;
-        const save_rows = ctx.rows;
-        status = ctx.cout.setCursorPosition(ctx.cols - 20, ctx.rows - 1);
-        if (status != uefi.Status.Success) {
-            print(ctx.cout, "Couldn't set cursor position!\r\n");
-            hang();
-        }
+        const save_cols = ctx.cout.mode.cursor_column;
+        const save_rows = ctx.cout.mode.cursor_row;
+        status = ctx.cout.setCursorPosition(ctx.max_cols - 20, ctx.max_rows - 1);
+        checkForError(status, "Couldn't set cursor position!\r\n");
 
         {
             var buf = std.mem.zeroes([128]u8);
@@ -152,11 +164,8 @@ pub fn print_date(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
             print(ctx.cout, msg);
         }
 
-        status = ctx.cout.setCursorPosition(save_cols, save_rows);
-        if (status != uefi.Status.Success) {
-            print(ctx.cout, "Couldn't set cursor position!\r\n");
-            hang();
-        }
+        status = ctx.cout.setCursorPosition(@intCast(save_cols), @intCast(save_rows));
+        checkForError(status, "Couldn't set cursor position 2!\r\n");
     }
 }
 
@@ -166,54 +175,53 @@ pub fn main() void {
     var status = std.mem.zeroes(uefi.Status);
 
     const cout = uefi.system_table.con_out.?;
-    const cin = uefi.system_table.con_in.?;
 
-    _ = cout.reset(true);
-    _ = cin.reset(true);
+    status = cout.reset(true);
+    checkForError(status, "Failed to reset console out!\r\n");
+
+    status = cout.clearScreen();
+    checkForError(status, "Failed to clear screen!\r\n");
+
+    const cin = uefi.system_table.con_in.?;
+    status = cin.reset(true);
+    checkForError(status, "Failed to clear console in!\r\n");
+
+    status = cout.setAttribute(EfiColor.black.bg(EfiColor.light_gray));
+    checkForError(status, "Setting the background and foreground color failed!\r\n");
+
+    status = cout.clearScreen();
+    checkForError(status, "Failed to clear screen!\r\n");
 
     var gop: *uefi.protocol.GraphicsOutput = undefined;
-    status = boot_services.locateProtocol(&uefi.protocol.GraphicsOutput.guid, null, @as(*?*anyopaque, @ptrCast(&gop)));
-    if (status != uefi.Status.Success) {
-        print(cout, "No GOP!\r\n");
-        hang();
-    }
-    print(cout, "Has GOP!\r\n");
+
+    status = boot_services.locateProtocol(
+        &uefi.protocol.GraphicsOutput.guid,
+        null,
+        @as(*?*anyopaque, @ptrCast(&gop)),
+    );
+    checkForError(status, "No GOP!\r\n");
 
     var size_of_info = std.mem.zeroes(usize);
     var info = std.mem.zeroes(uefi.protocol.GraphicsOutput.Mode.Info);
     var ptr = &info;
 
     status = gop.queryMode(0, &size_of_info, &ptr);
-    if (status != uefi.Status.Success) {
-        print(cout, "Quering for mode 0 failed\r\n!");
-        hang();
-    }
+    checkForError(status, "Quering for mode 0 failed!\r\n");
 
-    const max_mode = gop.mode.max_mode;
-    status = gop.setMode(max_mode);
-    if (status != uefi.Status.Success) {
-        print(cout, "Set mode 0 failed!\r\n");
-        hang();
-    }
+    status = gop.setMode(gop.mode.max_mode - 1);
+    checkForError(status, "Failed to set mode to max_mode - 1!\r\n");
 
-    status = cout.setAttribute(EfiColor.black.bg(EfiColor.light_gray));
-    status = cout.clearScreen();
-    if (status != uefi.Status.Success) {
-        print(cout, "Clearing the screen failed!\r\n");
-        hang();
-    }
+    var max_cols: usize = 0;
+    var max_rows: usize = 0;
+    status = cout.queryMode(0, &max_cols, &max_rows);
+    checkForError(status, "Getting rows and cols failed!\r\n");
 
-    var cols: usize = 0;
-    var rows: usize = 0;
-    status = cout.queryMode(0, &cols, &rows);
-    if (status != uefi.Status.Success) {
-        print(cout, "Getting rows and cols failed!\r\n");
-        hang();
-    }
+    status = cout.setMode(0);
+    checkForError(status, "Failed to set text mode!\r\n");
 
     var date_ctx = DateCtx{
-        .cols = @intCast(cols),
-        .rows = @intCast(rows),
+        .max_cols = @intCast(max_cols),
+        .max_rows = @intCast(max_rows),
         .cout = cout,
         .rt_services = rt_services,
     };
@@ -226,19 +234,12 @@ pub fn main() void {
         &date_ctx,
         &date_event,
     );
-    if (status != uefi.Status.Success) {
-        print(cout, "Creating event failed!\r\n");
-        hang();
-    }
+    checkForError(status, "Creating event failed!\r\n");
     defer _ = boot_services.closeEvent(date_event);
 
     status = boot_services.setTimer(date_event, .TimerPeriodic, 10_000_000);
-    if (status != uefi.Status.Success) {
-        print(cout, "Couldn't set timer interval!\r\n");
-        hang();
-    }
+    checkForError(status, "Couldn't set timer interval!\r\n");
 
-    //TODO: query mode 0 and check to make sure that mode 0 works
     {
         var buf = std.mem.zeroes([1024]u8);
         const msg = std.fmt.bufPrint(
@@ -278,17 +279,11 @@ pub fn main() void {
         &timer_ctx,
         &event,
     );
-    if (status != uefi.Status.Success) {
-        print(cout, "Creating event failed!\r\n");
-        hang();
-    }
+    checkForError(status, "Creating event failed!\r\n");
     defer _ = boot_services.closeEvent(event);
 
     status = boot_services.setTimer(event, .TimerPeriodic, 10000000);
-    if (status != uefi.Status.Success) {
-        print(cout, "Couldn't set timer interval!\r\n");
-        hang();
-    }
+    checkForError(status, "Couldn't set timer interval!\r\n");
 
     var timer_ctx2 = TimerCtx{ .cout = cout };
     var event2: uefi.Event = undefined;
@@ -300,17 +295,11 @@ pub fn main() void {
         &timer_ctx2,
         &event2,
     );
-    if (status != uefi.Status.Success) {
-        print(cout, "Creating event failed!\r\n");
-        hang();
-    }
+    checkForError(status, "Creating event failed!\r\n");
     defer _ = boot_services.closeEvent(event2);
 
     status = boot_services.setTimer(event2, .TimerPeriodic, 20000000);
-    if (status != uefi.Status.Success) {
-        print(cout, "Couldn't set timer interval!\r\n");
-        hang();
-    }
+    checkForError(status, "Couldn't set timer interval!\r\n");
 
     while (true) {
         print(cout, "Enter any key: \r\n");
