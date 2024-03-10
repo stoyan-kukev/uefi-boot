@@ -1,6 +1,151 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const uefi = std.os.uefi;
+
+const colors = @import("eficolor.zig");
+const DEFAULT_COLOR = colors.DEFAULT_COLOR;
+const HIGHLIGHT_COLOR = colors.HIGHLIGHT_COLOR;
+
+pub const ESC_KEY: u16 = 0x17;
+pub const UP_ARROW: u16 = 0x1;
+pub const DOWN_ARROW: u16 = 0x2;
+
+const setTextMode = @import("textmode.zig").setTextMode;
+
+pub var cout: *uefi.protocol.SimpleTextOutput = undefined;
+pub var cin: *uefi.protocol.SimpleTextInput = undefined;
+pub var cerr: *uefi.protocol.SimpleTextOutput = undefined;
+pub var boot_services: *uefi.tables.BootServices = undefined;
+pub var rt_services: *uefi.tables.RuntimeServices = undefined;
+
+var timer_event: uefi.Event = undefined;
+
+pub fn main() uefi.Status {
+    var memory_buffer: [100000]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&memory_buffer);
+    const alloc = fba.allocator();
+
+    boot_services = uefi.system_table.boot_services.?;
+    rt_services = uefi.system_table.runtime_services;
+
+    cout = uefi.system_table.con_out.?;
+    cin = uefi.system_table.con_in.?;
+    cerr = uefi.system_table.std_err.?;
+
+    cout.setAttribute(DEFAULT_COLOR).err() catch {};
+
+    boot_services.setWatchdogTimer(0, 0x3A7C2D05, 0, null).err() catch {};
+
+    const menu_choices = [_][]const u8{
+        "Set Text Mode",
+    };
+
+    const menu_funcs = [_]*const fn (alloc: std.mem.Allocator) uefi.Status{
+        &setTextMode,
+    };
+
+    setTextMode(alloc).err() catch {};
+
+    while (true) {
+        cout.clearScreen().err() catch {};
+
+        var max_cols: usize = undefined;
+        var max_rows: usize = undefined;
+        cout.queryMode(cout.mode.mode, &max_cols, &max_rows).err() catch {};
+
+        var date_ctx = DateCtx{
+            .max_cols = @intCast(max_cols),
+            .max_rows = @intCast(max_rows),
+        };
+
+        boot_services.createEvent(
+            EfiEventType.timer.with(.notify_signal),
+            @intFromEnum(EfiTPL.notify),
+            &print_date,
+            &date_ctx,
+            &timer_event,
+        ).err() catch {};
+
+        boot_services.setTimer(timer_event, .TimerPeriodic, 10_000_000).err() catch {};
+
+        cout.setCursorPosition(0, max_rows - 3).err() catch {};
+        print("Up/Down Arrow = Move Cursor\r\nEnter = Select\r\nEscape = Go Back");
+
+        cout.setCursorPosition(0, 0).err() catch {};
+        cout.setAttribute(HIGHLIGHT_COLOR).err() catch {};
+        printArgs(alloc, "{s}\r\n", .{menu_choices[0]});
+
+        cout.setAttribute(DEFAULT_COLOR).err() catch {};
+        for (1..menu_choices.len) |i| {
+            printArgs(alloc, "{}\r\n", .{menu_choices[i]});
+        }
+
+        const min_row: usize = 0;
+        const max_row: usize = @intCast(cout.mode.cursor_row);
+
+        cout.setCursorPosition(0, 0).err() catch {};
+        var getting_input = true;
+        while (getting_input) {
+            var current_row: usize = @intCast(cout.mode.cursor_row);
+            const key = getKey();
+            printArgs(alloc, "scan_code: {}\r\nchar_code: {}\r\n", .{ key.input.scan_code, key.input.unicode_char });
+            hang();
+
+            switch (key.input.scan_code) {
+                UP_ARROW => {
+                    if (current_row - 1 >= min_row) {
+                        // De-highlight current row, move up 1 row, highlight new row
+                        cout.setAttribute(DEFAULT_COLOR).err() catch {};
+                        printArgs(alloc, "{s}\r", .{menu_choices[current_row]});
+
+                        current_row -= 1;
+                        cout.setCursorPosition(0, current_row).err() catch {};
+                        cout.setAttribute(HIGHLIGHT_COLOR).err() catch {};
+                        printArgs(alloc, "{s}\r", .{menu_choices[current_row]});
+
+                        // Reset colors
+                        cout.setAttribute(DEFAULT_COLOR).err() catch {};
+                    }
+                    break;
+                },
+                DOWN_ARROW => {
+                    if (current_row + 1 <= max_row) {
+                        // De-highlight current row, move up 1 row, highlight new row
+                        cout.setAttribute(DEFAULT_COLOR).err() catch {};
+                        printArgs(alloc, "{s}\r", .{menu_choices[current_row]});
+
+                        current_row += 1;
+                        cout.setCursorPosition(0, current_row).err() catch {};
+                        cout.setAttribute(HIGHLIGHT_COLOR).err() catch {};
+                        printArgs(alloc, "{s}\r", .{menu_choices[current_row]});
+
+                        // Reset colors
+                        cout.setAttribute(DEFAULT_COLOR).err() catch {};
+                    }
+                    break;
+                },
+                ESC_KEY => {
+                    boot_services.closeEvent(timer_event).err() catch {};
+                    rt_services.resetSystem(.ResetShutdown, .Success, 0, null);
+                    break;
+                },
+                else => {
+                    if (key.input.scan_code == 0x13) {
+                        menu_funcs[current_row](alloc).err() catch |err| {
+                            printArgs(alloc, "ERROR {}\r\n Press any key to go back...", .{err});
+                        };
+
+                        getting_input = false;
+                    }
+                    break;
+                },
+            }
+        }
+    }
+
+    return uefi.Status.Success;
+}
+
 fn hang() void {
     while (true) {
         asm volatile ("pause");
@@ -14,6 +159,20 @@ const EfiEventType = enum(u32) {
     notify_signal = 0x0000_0200,
     exit_boot_services = 0x0000_0201,
     virtual_address_change = 0x6000_0202,
+
+    pub fn with(self: EfiEventType, comptime effect: EfiEventType) u32 {
+        // switch (self) {
+        //     .timer, .runtime => {
+        //         switch (effect) {
+        //             .notify_wait, .notify_signal, .exit_boot_services => {},
+        //             else => @compileError("Effect needs to be either notify_(wait|signal) or exit_boot_services"),
+        //         }
+        //     },
+        //     else => @compileError("Self needs to be either timer or runtime"),
+        // }
+
+        return @intFromEnum(self) | @intFromEnum(effect);
+    }
 };
 
 const EfiTPL = enum(usize) {
@@ -23,34 +182,20 @@ const EfiTPL = enum(usize) {
     high_level = 31,
 };
 
-const EfiColor = enum(usize) {
-    black,
-    blue,
-    green,
-    cyan,
-    red,
-    magenta,
-    brown,
-    light_gray,
-    dark_gray,
-    light_blue,
-    light_green,
-    light_cyan,
-    light_red,
-    light_magenta,
-    yellow,
-    white,
+pub fn getKey() uefi.protocol.SimpleTextInput.Key {
+    var events: [1]uefi.Event = undefined;
+    events[0] = cin.wait_for_key;
 
-    pub fn bg(self: EfiColor, comptime bgc: EfiColor) usize {
-        if (@intFromEnum(bgc) > @intFromEnum(EfiColor.light_gray)) {
-            @compileError("Background color can only be from black to brown");
-        }
+    var index: usize = undefined;
+    boot_services.waitForEvent(1, &events, &index).err() catch {};
 
-        return @intFromEnum(self) | (@intFromEnum(bgc) << 4);
-    }
-};
+    var key: uefi.protocol.SimpleTextInput.Key = undefined;
+    if (index == 0) cin.readKeyStroke(&key.input).err() catch {};
 
-fn print(out: *const uefi.protocol.SimpleTextOutput, buf: []const u8) void {
+    return key;
+}
+
+pub fn print(buf: []const u8) void {
     const view = std.unicode.Utf8View.init(buf) catch unreachable;
     var iter = view.iterator();
 
@@ -60,7 +205,7 @@ fn print(out: *const uefi.protocol.SimpleTextOutput, buf: []const u8) void {
     while (iter.nextCodepoint()) |rune| {
         if (index + 1 >= utf16.len) {
             utf16[index] = 0;
-            _ = out.outputString(utf16[0..index :0]);
+            _ = cout.outputString(utf16[0..index :0]);
             index = 0;
         }
 
@@ -91,61 +236,43 @@ fn print(out: *const uefi.protocol.SimpleTextOutput, buf: []const u8) void {
 
     if (index != 0) {
         utf16[index] = 0;
-        _ = out.outputString(utf16[0..index :0]);
+        _ = cout.outputString(utf16[0..index :0]);
     }
 }
 
-pub fn checkForError(status: uefi.Status, msg: []const u8) void {
-    const cout = uefi.system_table.con_out.?;
-
-    switch (status) {
-        .Success => {},
-        else => {
-            var buf = std.mem.zeroes([128]u8);
-            const fmt_msg = std.fmt.bufPrint(
-                &buf,
-                "[{}] {s}",
-                .{ status, msg },
-            ) catch "Creating buffer failed\r\n";
-            print(cout, fmt_msg);
-            hang();
-        },
-    }
-}
+// pub fn checkForError(status: uefi.Status, msg: []const u8) void {
+//     switch (status) {
+//         .Success => {},
+//         else => {
+//             var buf = std.mem.zeroes([128]u8);
+//             const fmt_msg = std.fmt.bufPrint(
+//                 &buf,
+//                 "[{}] {s}",
+//                 .{ status, msg },
+//             ) catch "Creating buffer failed\r\n";
+//             print(fmt_msg);
+//             hang();
+//         },
+//     }
+// }
 
 const EfiInputKey = uefi.protocol.SimpleTextInput.Key;
-
-const TimerCtx = struct {
-    cout: *uefi.protocol.SimpleTextOutput,
-};
 
 const DateCtx = struct {
     max_cols: u32,
     max_rows: u32,
-    cout: *uefi.protocol.SimpleTextOutput,
-    rt_services: *uefi.tables.RuntimeServices,
 };
-
-pub fn timerNotify(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
-    _ = event;
-    if (data) |timer_ctx| {
-        const timer_data: *TimerCtx = @ptrCast(@alignCast(timer_ctx));
-        print(timer_data.cout, "test 123");
-    }
-}
 
 pub fn print_date(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
     _ = event;
     if (data) |date_ctx| {
         const ctx: *DateCtx = @ptrCast(@alignCast(date_ctx));
         var time: uefi.Time = undefined;
-        var status = ctx.rt_services.getTime(&time, null);
-        checkForError(status, "Couldn't get time!\r\n");
+        rt_services.getTime(&time, null).err() catch {};
 
-        const save_cols = ctx.cout.mode.cursor_column;
-        const save_rows = ctx.cout.mode.cursor_row;
-        status = ctx.cout.setCursorPosition(ctx.max_cols - 20, ctx.max_rows - 1);
-        checkForError(status, "Couldn't set cursor position!\r\n");
+        const save_cols = cout.mode.cursor_column;
+        const save_rows = cout.mode.cursor_row;
+        cout.setCursorPosition(ctx.max_cols - 20, ctx.max_rows - 1).err() catch {};
 
         {
             var buf = std.mem.zeroes([128]u8);
@@ -161,157 +288,23 @@ pub fn print_date(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
                     time.second,
                 },
             ) catch "Creating buffer failed\r\n";
-            print(ctx.cout, msg);
+            print(msg);
         }
 
-        status = ctx.cout.setCursorPosition(@intCast(save_cols), @intCast(save_rows));
-        checkForError(status, "Couldn't set cursor position 2!\r\n");
+        cout.setCursorPosition(@intCast(save_cols), @intCast(save_rows)).err() catch {};
     }
 }
 
-pub fn main() void {
-    const boot_services = uefi.system_table.boot_services.?;
-    const rt_services = uefi.system_table.runtime_services;
-    var status = std.mem.zeroes(uefi.Status);
+pub fn printArgs(
+    alloc: std.mem.Allocator,
+    comptime msg: []const u8,
+    args: anytype,
+) void {
+    const utf_text = std.fmt.allocPrint(alloc, msg, args) catch unreachable;
+    defer alloc.free(utf_text);
 
-    const cout = uefi.system_table.con_out.?;
+    const text = std.unicode.utf8ToUtf16LeAllocZ(alloc, utf_text) catch unreachable;
+    defer alloc.free(text);
 
-    status = cout.reset(true);
-    checkForError(status, "Failed to reset console out!\r\n");
-
-    status = cout.clearScreen();
-    checkForError(status, "Failed to clear screen!\r\n");
-
-    const cin = uefi.system_table.con_in.?;
-    status = cin.reset(true);
-    checkForError(status, "Failed to clear console in!\r\n");
-
-    status = cout.setAttribute(EfiColor.black.bg(EfiColor.light_gray));
-    checkForError(status, "Setting the background and foreground color failed!\r\n");
-
-    status = cout.clearScreen();
-    checkForError(status, "Failed to clear screen!\r\n");
-
-    var gop: *uefi.protocol.GraphicsOutput = undefined;
-
-    status = boot_services.locateProtocol(
-        &uefi.protocol.GraphicsOutput.guid,
-        null,
-        @as(*?*anyopaque, @ptrCast(&gop)),
-    );
-    checkForError(status, "No GOP!\r\n");
-
-    var size_of_info = std.mem.zeroes(usize);
-    var info = std.mem.zeroes(uefi.protocol.GraphicsOutput.Mode.Info);
-    var ptr = &info;
-
-    status = gop.queryMode(0, &size_of_info, &ptr);
-    checkForError(status, "Quering for mode 0 failed!\r\n");
-
-    status = gop.setMode(gop.mode.max_mode - 1);
-    checkForError(status, "Failed to set mode to max_mode - 1!\r\n");
-
-    var max_cols: usize = 0;
-    var max_rows: usize = 0;
-    status = cout.queryMode(0, &max_cols, &max_rows);
-    checkForError(status, "Getting rows and cols failed!\r\n");
-
-    status = cout.setMode(0);
-    checkForError(status, "Failed to set text mode!\r\n");
-
-    var date_ctx = DateCtx{
-        .max_cols = @intCast(max_cols),
-        .max_rows = @intCast(max_rows),
-        .cout = cout,
-        .rt_services = rt_services,
-    };
-    var date_event: uefi.Event = undefined;
-
-    status = boot_services.createEvent(
-        @intFromEnum(EfiEventType.timer) | @intFromEnum(EfiEventType.notify_signal),
-        @intFromEnum(EfiTPL.callback),
-        print_date,
-        &date_ctx,
-        &date_event,
-    );
-    checkForError(status, "Creating event failed!\r\n");
-    defer _ = boot_services.closeEvent(date_event);
-
-    status = boot_services.setTimer(date_event, .TimerPeriodic, 10_000_000);
-    checkForError(status, "Couldn't set timer interval!\r\n");
-
-    {
-        var buf = std.mem.zeroes([1024]u8);
-        const msg = std.fmt.bufPrint(
-            &buf,
-            "Max mode: {}\r\nMode: {}\r\nFramebuffer size: {}\r\n",
-            .{
-                gop.mode.max_mode,
-                gop.mode.mode,
-                gop.mode.frame_buffer_size,
-            },
-        ) catch "Creating buffer failed!\r\n";
-        print(cout, msg);
-    }
-
-    {
-        var buf = std.mem.zeroes([1024]u8);
-        const msg = std.fmt.bufPrint(
-            &buf,
-            "version: {}\r\nhorizontal resolution: {}\r\nvertical resolution: {}\r\nppsl: {}\r\n",
-            .{
-                ptr.version,
-                ptr.horizontal_resolution,
-                ptr.vertical_resolution,
-                ptr.pixels_per_scan_line,
-            },
-        ) catch "Creating buffer failed\r\n";
-        print(cout, msg);
-    }
-
-    var timer_ctx = TimerCtx{ .cout = cout };
-    var event: uefi.Event = undefined;
-
-    status = boot_services.createEvent(
-        @intFromEnum(EfiEventType.timer) | @intFromEnum(EfiEventType.notify_signal),
-        @intFromEnum(EfiTPL.callback),
-        timerNotify,
-        &timer_ctx,
-        &event,
-    );
-    checkForError(status, "Creating event failed!\r\n");
-    defer _ = boot_services.closeEvent(event);
-
-    status = boot_services.setTimer(event, .TimerPeriodic, 10000000);
-    checkForError(status, "Couldn't set timer interval!\r\n");
-
-    var timer_ctx2 = TimerCtx{ .cout = cout };
-    var event2: uefi.Event = undefined;
-
-    status = boot_services.createEvent(
-        @intFromEnum(EfiEventType.timer) | @intFromEnum(EfiEventType.notify_signal),
-        @intFromEnum(EfiTPL.callback),
-        timerNotify,
-        &timer_ctx2,
-        &event2,
-    );
-    checkForError(status, "Creating event failed!\r\n");
-    defer _ = boot_services.closeEvent(event2);
-
-    status = boot_services.setTimer(event2, .TimerPeriodic, 20000000);
-    checkForError(status, "Couldn't set timer interval!\r\n");
-
-    while (true) {
-        print(cout, "Enter any key: \r\n");
-
-        var key: EfiInputKey.Input = undefined;
-        while (cin.readKeyStroke(&key) == uefi.Status.NotReady) {}
-        print(cout, "Found key!\r\n");
-
-        var buf = std.mem.zeroes([128]u8);
-        const msg = std.fmt.bufPrint(&buf, "key pressed: {}\r\n", .{key.unicode_char}) catch "Creating buffer failed!\r\n";
-        print(cout, msg);
-    }
-
-    hang();
+    cout.outputString(text).err() catch {};
 }
