@@ -11,12 +11,14 @@ pub const UP_ARROW: u16 = 0x1;
 pub const DOWN_ARROW: u16 = 0x2;
 
 const setTextMode = @import("textmode.zig").setTextMode;
+const setVideoMode = @import("videomode.zig").setVideoMode;
 
 pub var cout: *uefi.protocol.SimpleTextOutput = undefined;
 pub var cin: *uefi.protocol.SimpleTextInput = undefined;
 pub var cerr: *uefi.protocol.SimpleTextOutput = undefined;
 pub var boot_services: *uefi.tables.BootServices = undefined;
 pub var rt_services: *uefi.tables.RuntimeServices = undefined;
+pub var gop: *uefi.protocol.GraphicsOutput = undefined;
 
 var timer_event: uefi.Event = undefined;
 
@@ -27,10 +29,10 @@ pub fn main() uefi.Status {
 
     boot_services = uefi.system_table.boot_services.?;
     rt_services = uefi.system_table.runtime_services;
-
     cout = uefi.system_table.con_out.?;
     cin = uefi.system_table.con_in.?;
     cerr = uefi.system_table.std_err.?;
+    boot_services.locateProtocol(&uefi.protocol.GraphicsOutput.guid, null, @ptrCast(&gop)).err() catch {};
 
     cout.setAttribute(DEFAULT_COLOR).err() catch {};
 
@@ -39,114 +41,57 @@ pub fn main() uefi.Status {
     const menu_choices = [_][]const u8{
         "Set Text Mode",
     };
+    _ = menu_choices;
 
     const menu_funcs = [_]*const fn (alloc: std.mem.Allocator) uefi.Status{
         &setTextMode,
     };
+    _ = menu_funcs;
+
+    var time = std.mem.zeroes(uefi.Time);
+    var time_ctx = TimeCtx{ .time = &time };
+
+    boot_services.createEvent(
+        EfiEventType.timer.with(.notify_signal),
+        @intFromEnum(EfiTPL.notify),
+        &get_time,
+        &time_ctx,
+        &timer_event,
+    ).err() catch {};
+
+    boot_services.setTimer(timer_event, .TimerPeriodic, 10_000_000).err() catch {};
+
+    var max_cols: usize = undefined;
+    var max_rows: usize = undefined;
+    cout.queryMode(cout.mode.mode, &max_cols, &max_rows).err() catch {};
 
     setTextMode(alloc).err() catch {};
 
-    while (true) {
+    // var menu_index: usize = 0;
+    const getting_input = true;
+    // var current_row: usize = @intCast(cout.mode.cursor_row);
+
+    while (getting_input) {
+        cout.setCursorPosition(max_cols - 20, max_rows).err() catch {};
+        printArgs(
+            alloc,
+            "{}-{}-{} {}:{}:{}",
+            .{
+                time.year,
+                time.month,
+                time.day,
+                time.hour,
+                time.minute,
+                time.second,
+            },
+        );
         cout.clearScreen().err() catch {};
-
-        var max_cols: usize = undefined;
-        var max_rows: usize = undefined;
-        cout.queryMode(cout.mode.mode, &max_cols, &max_rows).err() catch {};
-
-        var date_ctx = DateCtx{
-            .max_cols = @intCast(max_cols),
-            .max_rows = @intCast(max_rows),
-        };
-
-        boot_services.createEvent(
-            EfiEventType.timer.with(.notify_signal),
-            @intFromEnum(EfiTPL.notify),
-            &print_date,
-            &date_ctx,
-            &timer_event,
-        ).err() catch {};
-
-        boot_services.setTimer(timer_event, .TimerPeriodic, 10_000_000).err() catch {};
-
-        cout.setCursorPosition(0, max_rows - 3).err() catch {};
-        print("Up/Down Arrow = Move Cursor\r\nEnter = Select\r\nEscape = Go Back");
-
-        cout.setCursorPosition(0, 0).err() catch {};
-        cout.setAttribute(HIGHLIGHT_COLOR).err() catch {};
-        printArgs(alloc, "{s}\r\n", .{menu_choices[0]});
-
-        cout.setAttribute(DEFAULT_COLOR).err() catch {};
-        for (1..menu_choices.len) |i| {
-            printArgs(alloc, "{}\r\n", .{menu_choices[i]});
-        }
-
-        const min_row: usize = 0;
-        const max_row: usize = @intCast(cout.mode.cursor_row);
-
-        cout.setCursorPosition(0, 0).err() catch {};
-        var getting_input = true;
-        while (getting_input) {
-            var current_row: usize = @intCast(cout.mode.cursor_row);
-            const key = getKey();
-            printArgs(alloc, "scan_code: {}\r\nchar_code: {}\r\n", .{ key.input.scan_code, key.input.unicode_char });
-            hang();
-
-            switch (key.input.scan_code) {
-                UP_ARROW => {
-                    if (current_row - 1 >= min_row) {
-                        // De-highlight current row, move up 1 row, highlight new row
-                        cout.setAttribute(DEFAULT_COLOR).err() catch {};
-                        printArgs(alloc, "{s}\r", .{menu_choices[current_row]});
-
-                        current_row -= 1;
-                        cout.setCursorPosition(0, current_row).err() catch {};
-                        cout.setAttribute(HIGHLIGHT_COLOR).err() catch {};
-                        printArgs(alloc, "{s}\r", .{menu_choices[current_row]});
-
-                        // Reset colors
-                        cout.setAttribute(DEFAULT_COLOR).err() catch {};
-                    }
-                    break;
-                },
-                DOWN_ARROW => {
-                    if (current_row + 1 <= max_row) {
-                        // De-highlight current row, move up 1 row, highlight new row
-                        cout.setAttribute(DEFAULT_COLOR).err() catch {};
-                        printArgs(alloc, "{s}\r", .{menu_choices[current_row]});
-
-                        current_row += 1;
-                        cout.setCursorPosition(0, current_row).err() catch {};
-                        cout.setAttribute(HIGHLIGHT_COLOR).err() catch {};
-                        printArgs(alloc, "{s}\r", .{menu_choices[current_row]});
-
-                        // Reset colors
-                        cout.setAttribute(DEFAULT_COLOR).err() catch {};
-                    }
-                    break;
-                },
-                ESC_KEY => {
-                    boot_services.closeEvent(timer_event).err() catch {};
-                    rt_services.resetSystem(.ResetShutdown, .Success, 0, null);
-                    break;
-                },
-                else => {
-                    if (key.input.scan_code == 0x13) {
-                        menu_funcs[current_row](alloc).err() catch |err| {
-                            printArgs(alloc, "ERROR {}\r\n Press any key to go back...", .{err});
-                        };
-
-                        getting_input = false;
-                    }
-                    break;
-                },
-            }
-        }
     }
 
     return uefi.Status.Success;
 }
 
-fn hang() void {
+pub fn hang() void {
     while (true) {
         asm volatile ("pause");
     }
@@ -240,58 +185,17 @@ pub fn print(buf: []const u8) void {
     }
 }
 
-// pub fn checkForError(status: uefi.Status, msg: []const u8) void {
-//     switch (status) {
-//         .Success => {},
-//         else => {
-//             var buf = std.mem.zeroes([128]u8);
-//             const fmt_msg = std.fmt.bufPrint(
-//                 &buf,
-//                 "[{}] {s}",
-//                 .{ status, msg },
-//             ) catch "Creating buffer failed\r\n";
-//             print(fmt_msg);
-//             hang();
-//         },
-//     }
-// }
-
 const EfiInputKey = uefi.protocol.SimpleTextInput.Key;
 
-const DateCtx = struct {
-    max_cols: u32,
-    max_rows: u32,
+const TimeCtx = struct {
+    time: *uefi.Time,
 };
 
-pub fn print_date(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
+pub fn get_time(event: uefi.Event, data: ?*anyopaque) callconv(uefi.cc) void {
     _ = event;
     if (data) |date_ctx| {
-        const ctx: *DateCtx = @ptrCast(@alignCast(date_ctx));
-        var time: uefi.Time = undefined;
-        rt_services.getTime(&time, null).err() catch {};
-
-        const save_cols = cout.mode.cursor_column;
-        const save_rows = cout.mode.cursor_row;
-        cout.setCursorPosition(ctx.max_cols - 20, ctx.max_rows - 1).err() catch {};
-
-        {
-            var buf = std.mem.zeroes([128]u8);
-            const msg = std.fmt.bufPrint(
-                &buf,
-                "{}-{}-{} {}:{}:{}",
-                .{
-                    time.year,
-                    time.month,
-                    time.day,
-                    time.hour,
-                    time.minute,
-                    time.second,
-                },
-            ) catch "Creating buffer failed\r\n";
-            print(msg);
-        }
-
-        cout.setCursorPosition(@intCast(save_cols), @intCast(save_rows)).err() catch {};
+        const ctx: *TimeCtx = @ptrCast(@alignCast(date_ctx));
+        rt_services.getTime(ctx.time, null).err() catch {};
     }
 }
 
